@@ -1,21 +1,26 @@
-# 🌐 compound-web (English Dialect Interface)
+# 🌐 compound-web (English Production Interface)
+import_karo web
 
-# Server object and helper methods in English
-keep server_port = 8080
+keep app_server = newServer(8080)
 
-task create_server(p) do
-    server_port = p
-    show "🌐 Web server ready on port:", p
+task create_web_server(p) do
+    app_server = newServer(p)
+    show "🌐 Web server initialized on port:", p
 done
 
-task listen_route(path, handler) do
-    show "📍 Registered Route:", path
+task listen_route(m, path, handler) do
+    app_server.addRoute(m, path, handler)
+    show "📍 Registered Route [" + m + "]:", path
 done
 
-task send_response(msg) do
-    return "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + msg
+task send_text(req, body) do
+    asyncCheck req.sendText(body)
 done
 
-task start_server() do
-    show "🚀 Server running at http://localhost:" + $server_port
+task send_json(req, json_body) do
+    asyncCheck req.sendJson(json_body)
+done
+
+task start_web_server() do
+    app_server.start()
 done

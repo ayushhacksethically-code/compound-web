@@ -1,21 +1,26 @@
-# 🌐 compound-web (Hinglish Dialect Interface)
+# 🌐 compound-web (Hinglish Production Interface)
+import_karo web
 
-# Server object and helper methods in Hinglish
-rakho server_port = 8080
+rakho app_server = newServer(8080)
 
-kaam server_banao(p) toh
-    server_port = p
-    dikhao "🌐 Web server port par ready hai:", p
+kaam web_server_banao(p) toh
+    app_server = newServer(p)
+    dikhao "🌐 Web server initialize ho gaya port par:", p
 khatam
 
-kaam route_suno(path, handler) toh
-    dikhao "📍 Registered Route:", path
+kaam route_suno(m, path, handler) toh
+    app_server.addRoute(m, path, handler)
+    dikhao "📍 Registered Route [" + m + "]:", path
 khatam
 
-kaam jawab_bhejo(msg) toh
-    wapas "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + msg
+kaam send_text(req, body) toh
+    asyncCheck req.sendText(body)
 khatam
 
-kaam server_chalao() toh
-    dikhao "🚀 Server running at http://localhost:" + $server_port
+kaam send_json(req, json_body) toh
+    asyncCheck req.sendJson(json_body)
+khatam
+
+kaam web_server_start() toh
+    app_server.start()
 khatam
