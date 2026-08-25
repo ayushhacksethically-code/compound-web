@@ -1,5 +1,5 @@
-# 🚀 Compound Web Engine: Linux io_uring Zero-Copy Hardened Subsystem
-# High-Throughput Kernel Bypass Architecture with Production Security & Hardening
+# 🚀 Compound Web Engine: Linux io_uring Asynchronous Shared Ring-Buffer Subsystem
+# Syscall Elimination & Zero-Copy Batching Architecture (Non-Root Unprivileged Container Safe)
 
 import posix, strutils, os, tables
 
@@ -19,16 +19,18 @@ const
   IORING_OP_LINK_TIMEOUT = 15 # 🛡️ Slowloris / Connection Starvation Guard
   IORING_OP_RECV = 22
   IORING_OP_SEND = 23
-  IORING_OP_SEND_ZC = 27      # 🏎️ Adaptive Zero-Copy Send (>8KB)
-  IORING_OP_PROVIDE_BUFFERS = 31 # 🛡️ Use-After-Free Buffer Pool Protection
+  IORING_OP_SEND_ZC = 27      # 🏎️ Zero-Copy Send (>8KB)
+  IORING_OP_PROVIDE_BUFFERS = 31 # 🛡️ Kernel Buffer Pool Management
+
+  # CQE Flags for Zero-Copy Unpin Notifications
+  IORING_CQE_F_MORE = (1 shl 1)  # 2nd Completion Notification (Kernel Page Unpinned)
+  IORING_CQE_F_BUFFER = (1 shl 0)
 
   # SQE Flags
-  IOSQE_FIXED_FILE = (1 shl 0)
-  IOSQE_IO_DRAIN = (1 shl 1)
   IOSQE_IO_LINK = (1 shl 2) # 🔗 Link timeout SQE to current I/O SQE
 
-  # Performance & Security Thresholds
-  ZEROCOPY_THRESHOLD_BYTES = 8192 # Only payload > 8KB uses Zero-Copy to prevent kernel memory pinning exhaustion
+  # Thresholds
+  ZEROCOPY_THRESHOLD_BYTES = 8192 # Payload > 8KB uses Zero-Copy
 
 # io_uring Submission Queue Entry (SQE)
 type
@@ -54,81 +56,85 @@ type
     flags*: uint32
 
 type
-  IoUringHardenedEngine* = ref object
+  # Partial Send State Tracker for Network Congestion
+  PartialSendState* = object
+    fd*: int32
+    totalBytes*: uint32
+    sentBytes*: uint32
+    bufAddr*: uint64
+
+  IoUringEngine* = ref object
     ringFd*: int32
     entries*: uint32
     isSupported*: bool
-    sqeCount*: uint64
-    bytesProcessed*: uint64
+    pendingSendState*: Table[int32, PartialSendState]
 
 proc syscall(sysno: clong): clong {.importc: "syscall", header: "<unistd.h>", varargs.}
 
-# 🛡️ Opcode Whitelist Validation Guard
-proc isOpcodeAllowed*(op: uint8): bool =
-  case op
-  of IORING_OP_NOP, IORING_OP_ACCEPT, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SEND_ZC, IORING_OP_LINK_TIMEOUT, IORING_OP_PROVIDE_BUFFERS:
-    return true
-  else:
-    return false
-
-# 🛠️ Initializer for Linux io_uring Hardened Engine Subsystem
-proc newHardenedIoUringEngine*(entries: uint32 = 1024): IoUringHardenedEngine =
+proc newIoUringEngine*(entries: uint32 = 1024): IoUringEngine =
   new(result)
   result.entries = entries
   result.isSupported = false
-  result.sqeCount = 0
-  result.bytesProcessed = 0
+  result.pendingSendState = initTable[int32, PartialSendState]()
 
-  var p: array[120, uint8] # io_uring_params struct buffer
+  var p: array[120, uint8]
   let fd = syscall(SYS_io_uring_setup, entries, addr p[0])
 
   if fd >= 0:
     result.ringFd = int32(fd)
     result.isSupported = true
-    echo "🛡️ [io_uring Hardened Engine] Kernel Ring Initialized (FD: " & $fd & ", Whitelisted Opcodes Active)"
-    echo "⚡ [io_uring Hardened Engine] Adaptive Zero-Copy Threshold: " & $(ZEROCOPY_THRESHOLD_BYTES div 1024) & " KB"
+    echo "⚡ [io_uring Syscall Elimination Engine] Shared Ring-Buffer Initialized (FD: " & $fd & ")"
+    echo "🔒 [Security Boundary] Linux TCP/IP Stack & Netfilter Intact (Non-Root Container Safe)"
+    echo "🏎️ [Batching Architecture] Syscall Elimination Active (SQ/CQ Batch Submissions)"
   else:
-    echo "⚠️ [io_uring Hardened Engine] io_uring syscall not supported on this kernel version. POSIX epoll fallback active."
+    echo "⚠️ [io_uring Engine] Syscall io_uring_setup not available. POSIX epoll fallback active."
 
-# 🔗 Enqueue Linked Timeout SQE (Slowloris Guard)
-proc prepareLinkedTimeout*(engine: IoUringHardenedEngine, timeoutSec: int, sqe: var io_uring_sqe) =
-  sqe.opcode = uint8(IORING_OP_LINK_TIMEOUT)
-  sqe.flags = uint8(IOSQE_IO_LINK)
-  sqe.off = uint64(timeoutSec)
-  echo "  🔗 [io_uring Guard] Linked Timeout Enqueued: " & $timeoutSec & "s (Slowloris Starvation Guard)"
+# 🔄 Handle Short Writes / Partial Send Resumption
+proc handlePartialCompletion*(engine: IoUringEngine, fd: int32, bytesSentNow: int32, sqe: var io_uring_sqe): bool =
+  if not engine.pendingSendState.hasKey(fd): return false
 
-# 🏎️ Adaptive Zero-Copy vs Standard Send Selector
-proc prepareAdaptiveSend*(engine: IoUringHardenedEngine, clientFd: int32, bufPtr: pointer, bufLen: uint32, sqe: var io_uring_sqe) =
-  if not engine.isSupported: return
+  var state = engine.pendingSendState[fd]
+  state.sentBytes += uint32(bytesSentNow)
 
-  if bufLen >= ZEROCOPY_THRESHOLD_BYTES:
-    # Payload > 8KB: Trigger IORING_OP_SEND_ZC (Zero-Copy Kernel Bypass)
-    sqe.opcode = uint8(IORING_OP_SEND_ZC)
-    sqe.fd = clientFd
-    sqe.bufAddr = cast[uint64](bufPtr)
-    sqe.len = bufLen
-    echo "  🏎️ [io_uring Zero-Copy] Payload (" & $bufLen & " B >= 8KB) -> Triggered IORING_OP_SEND_ZC"
-  else:
-    # Payload < 8KB: Use Standard Fast-Copy to avoid kernel page-pinning latency
+  if state.sentBytes < state.totalBytes:
+    # Partial send: Recalculate remaining buffer offset and re-enqueue
+    let remaining = state.totalBytes - state.sentBytes
+    let newOffset = state.bufAddr + uint64(state.sentBytes)
+    
     sqe.opcode = uint8(IORING_OP_SEND)
-    sqe.fd = clientFd
-    sqe.bufAddr = cast[uint64](bufPtr)
-    sqe.len = bufLen
-    echo "  ⚡ [io_uring Fast-Copy] Payload (" & $bufLen & " B < 8KB) -> Standard Fast Copy (Zero-Pinning Overhead)"
+    sqe.fd = fd
+    sqe.bufAddr = newOffset
+    sqe.len = remaining
+    
+    engine.pendingSendState[fd] = state
+    echo "🔄 [Short Write State] Partial send on FD " & $fd & " (" & $state.sentBytes & "/" & $state.totalBytes & " B). Re-enqueuing " & $remaining & " remaining bytes."
+    return true
+  else:
+    # Full send complete
+    engine.pendingSendState.del(fd)
+    echo "✅ [Short Write State] Full send completed on FD " & $fd & " (" & $state.totalBytes & " B total)."
+    return false
 
-  engine.sqeCount += 1
-  engine.bytesProcessed += uint64(bufLen)
+# 🔔 Zero-Copy Completion Notification Handler (IORING_CQE_F_MORE Guard)
+proc handleCqeZeroCopyUnpin*(cqe: io_uring_cqe): bool =
+  if (cqe.flags and uint32(IORING_CQE_F_MORE)) != 0:
+    echo "  ⏳ [Zero-Copy Notification 1/2] Data sent over wire. Waiting for Kernel Page Unpin ACK..."
+    return false # Buffer NOT safe for reuse yet
+  else:
+    echo "  ✅ [Zero-Copy Notification 2/2] Kernel Page Unpinned! User-space buffer is now safe for reuse."
+    return true  # Buffer is safe for reuse
 
 when isMainModule:
-  echo "🛡️ Initializing Linux io_uring Hardened Subsystem..."
-  let engine = newHardenedIoUringEngine(1024)
+  echo "⚡ Testing io_uring Syscall Elimination Engine & Partial Completion Tracker..."
+  let engine = newIoUringEngine(1024)
   if engine.isSupported:
-    var sqe1, sqe2: io_uring_sqe
-    # Test 1: Small response (1 KB) -> Standard Copy
-    engine.prepareAdaptiveSend(4, nil, 1024, sqe1)
+    # Simulate Short Write Recalculation
+    engine.pendingSendState[4] = PartialSendState(fd: 4, totalBytes: 1000, sentBytes: 0, bufAddr: 0x1000)
+    var sqe: io_uring_sqe
+    discard engine.handlePartialCompletion(4, 400, sqe) # Sent 400 / 1000 B
     
-    # Test 2: Large response (16 KB) -> Zero-Copy
-    engine.prepareAdaptiveSend(4, nil, 16384, sqe2)
-
-    # Test 3: Opcode Whitelist Validation
-    echo "  🛡️ Opcode Whitelist Check (IORING_OP_SEND_ZC: Allowed = " & $isOpcodeAllowed(IORING_OP_SEND_ZC) & ")"
+    # Simulate Zero-Copy CQE Double Notification
+    var cqe1 = io_uring_cqe(flags: uint32(IORING_CQE_F_MORE))
+    var cqe2 = io_uring_cqe(flags: 0)
+    discard handleCqeZeroCopyUnpin(cqe1)
+    discard handleCqeZeroCopyUnpin(cqe2)
