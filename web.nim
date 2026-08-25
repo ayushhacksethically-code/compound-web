@@ -1,4 +1,4 @@
-import std/[asynchttpserver, asyncdispatch, tables, strutils, uri, json, times, os]
+import std/[asynchttpserver, asyncdispatch, tables, strutils, uri, json, times, os, cpuinfo]
 
 type
   RequestParams* = Table[string, string]
@@ -10,45 +10,110 @@ type
   Middleware* = proc(ctx: Context): Future[bool] {.async, closure, gcsafe.}
   RequestHandler* = proc(ctx: Context): Future[void] {.async, closure, gcsafe.}
 
-  RouteEntry* = object
-    meth*: string
-    pattern*: string
-    paramKeys*: seq[string]
-    handler*: RequestHandler
+  # 🌳 Radix Tree / Trie Node Structure for O(K) Path Routing
+  RadixNode* = ref object
+    segment*: string
+    paramName*: string
+    isParam*: bool
+    handlers*: Table[string, RequestHandler] # HTTP Method -> Handler
+    children*: seq[RadixNode]
 
   CompoundWebServer* = ref object
     port*: int
     maxBodySize*: int # Default 10MB
     enableCors*: bool
+    rootNode*: RadixNode
     middlewares*: seq[Middleware]
-    routes*: seq[RouteEntry]
+
+proc newRadixNode*(segment: string = ""): RadixNode =
+  new(result)
+  result.segment = segment
+  result.paramName = ""
+  result.isParam = false
+  result.handlers = initTable[string, RequestHandler]()
+  result.children = @[]
 
 proc newServer*(port: int = 8080, maxBodySize: int = 10 * 1024 * 1024, enableCors: bool = true): CompoundWebServer =
   new(result)
   result.port = port
   result.maxBodySize = maxBodySize
   result.enableCors = enableCors
+  result.rootNode = newRadixNode("")
   result.middlewares = @[]
-  result.routes = @[]
 
 proc use*(server: CompoundWebServer, middleware: Middleware) =
   server.middlewares.add(middleware)
 
-proc parsePattern(pattern: string, paramKeys: var seq[string]): string =
-  let parts = pattern.split('/')
-  var resParts: seq[string] = @[]
-  for part in parts:
-    if part.startsWith(":"):
-      paramKeys.add(part.substr(1))
-      resParts.add("([^/]+)")
-    else:
-      resParts.add(part)
-  result = resParts.join("/")
-
+# 🌳 Radix Tree Insert: O(K) Complexity where K = URL Segment Count
 proc addRoute*(server: CompoundWebServer, meth: string, pattern: string, handler: RequestHandler) =
-  var keys: seq[string] = @[]
-  discard parsePattern(pattern, keys)
-  server.routes.add(RouteEntry(meth: meth.toUpperAscii(), pattern: pattern, paramKeys: keys, handler: handler))
+  let upperMeth = meth.toUpperAscii()
+  let segments = pattern.strip(chars = {'/'}).split('/')
+  var current = server.rootNode
+
+  for seg in segments:
+    if seg.len == 0: continue
+    var foundChild: RadixNode = nil
+    let isParamSeg = seg.startsWith(":")
+    let paramKey = if isParamSeg: seg.substr(1) else: ""
+
+    for child in current.children:
+      if isParamSeg and child.isParam:
+        foundChild = child
+        break
+      elif not isParamSeg and not child.isParam and child.segment == seg:
+        foundChild = child
+        break
+
+    if foundChild.isNil:
+      let newNode = newRadixNode(seg)
+      newNode.isParam = isParamSeg
+      newNode.paramName = paramKey
+      current.children.add(newNode)
+      current = newNode
+    else:
+      current = foundChild
+
+  current.handlers[upperMeth] = handler
+
+# 🌳 Radix Tree Lookup: O(K) Complexity with Parameter Extraction
+proc matchRoute*(server: CompoundWebServer, meth: string, path: string, params: var RequestParams, handler: var RequestHandler): bool =
+  let upperMeth = meth.toUpperAscii()
+  let segments = path.strip(chars = {'/'}).split('/')
+  var current = server.rootNode
+  params = initTable[string, string]()
+
+  if path == "/" or path == "":
+    if current.handlers.hasKey(upperMeth):
+      handler = current.handlers[upperMeth]
+      return true
+    return false
+
+  for seg in segments:
+    if seg.len == 0: continue
+    var matchedChild: RadixNode = nil
+
+    # First attempt exact segment match
+    for child in current.children:
+      if not child.isParam and child.segment == seg:
+        matchedChild = child
+        break
+
+    # If no exact match, attempt param match (:id)
+    if matchedChild.isNil:
+      for child in current.children:
+        if child.isParam:
+          matchedChild = child
+          params[child.paramName] = decodeUrl(seg)
+          break
+
+    if matchedChild.isNil:
+      return false
+    current = matchedChild
+
+  if current.handlers.hasKey(upperMeth):
+    handler = current.handlers[upperMeth]
+    return true
+  return false
 
 proc getQueryMap*(rawQuery: string): RequestParams =
   result = initTable[string, string]()
@@ -75,36 +140,23 @@ proc sendJson*(ctx: Context, jsonString: string, status: HttpCode = Http200) {.a
 proc getBody*(ctx: Context): string =
   return ctx.req.body
 
-proc matchRoute(route: RouteEntry, meth: string, path: string, params: var RequestParams): bool =
-  if route.meth != meth: return false
-  
-  let routeParts = route.pattern.split('/')
-  let pathParts = path.split('/')
-  
-  if routeParts.len != pathParts.len: return false
-  
-  params = initTable[string, string]()
-  for i in 0 ..< routeParts.len:
-    if routeParts[i].startsWith(":"):
-      let key = routeParts[i].substr(1)
-      params[key] = decodeUrl(pathParts[i])
-    elif routeParts[i] != pathParts[i]:
-      return false
-  return true
-
+# 🚀 Server Startup with CPU Core Detection
 proc start*(server: CompoundWebServer) =
   let startTime = cpuTime()
+  let numCores = countProcessors()
   let httpSer = newAsyncHttpServer()
   let elapsedMs = (cpuTime() - startTime) * 1000.0
-  echo "🚀 [compound-web] Server initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
-  echo "📡 [compound-web] Listening on http://localhost:" & $server.port
+
+  echo "🚀 [compound-web v2] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
+  echo "💻 [compound-web v2] Detected CPU Cores: " & $numCores
+  echo "📡 [compound-web v2] Listening on http://localhost:" & $server.port
 
   proc cb(req: Request) {.async, gcsafe.} =
     try:
       let meth = ($req.reqMethod).toUpperAscii()
       let path = req.url.path
 
-      # Handle CORS Preflight OPTIONS
+      # 1. Handle CORS Preflight OPTIONS
       if server.enableCors and meth == "OPTIONS":
         let corsHeaders = newHttpHeaders([
           ("Access-Control-Allow-Origin", "*"),
@@ -114,31 +166,41 @@ proc start*(server: CompoundWebServer) =
         await req.respond(Http204, "", corsHeaders)
         return
 
-      # Body Size Guard (413 Payload Too Large)
+      # 2. Upfront Content-Length Header Check (Early DoS Protection)
+      if req.headers.hasKey("Content-Length"):
+        try:
+          let contentLength = parseInt(req.headers["Content-Length"])
+          if contentLength > server.maxBodySize:
+            let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
+            await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
+            return
+        except ValueError:
+          discard
+
+      # 3. Body Size Guard
       if req.body.len > server.maxBodySize:
         let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
         await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
         return
 
-      var matched = false
-      for route in server.routes:
-        var params = initTable[string, string]()
-        if matchRoute(route, meth, path, params):
-          let ctx = Context(req: req, params: params, query: getQueryMap(req.url.query))
-          
-          # Execute Middlewares
-          var pass = true
-          for mw in server.middlewares:
-            if not (await mw(ctx)):
-              pass = false
-              break
-          
-          if pass:
-            await route.handler(ctx)
-          matched = true
-          break
+      # 4. Radix Tree O(K) Route Dispatching
+      var params = initTable[string, string]()
+      var handler: RequestHandler = nil
+      let found = server.matchRoute(meth, path, params, handler)
 
-      if not matched:
+      if found and not handler.isNil:
+        let ctx = Context(req: req, params: params, query: getQueryMap(req.url.query))
+        
+        # Execute Middlewares
+        var pass = true
+        for mw in server.middlewares:
+          if not (await mw(ctx)):
+            pass = false
+            break
+        
+        if pass:
+          await handler(ctx)
+      else:
         let notFoundHeaders = newHttpHeaders([("Content-Type", "application/json")])
         await req.respond(Http404, "{\"error\": \"404 Not Found\", \"path\": \"" & path & "\"}", notFoundHeaders)
     except Exception as e:
