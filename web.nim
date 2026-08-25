@@ -22,6 +22,7 @@ type
     port*: int
     maxBodySize*: int # Default 10MB
     enableCors*: bool
+    isFrozen*: bool # Invariant: Route table frozen after server startup for thread safety
     rootNode*: RadixNode
     middlewares*: seq[Middleware]
 
@@ -38,14 +39,20 @@ proc newServer*(port: int = 8080, maxBodySize: int = 10 * 1024 * 1024, enableCor
   result.port = port
   result.maxBodySize = maxBodySize
   result.enableCors = enableCors
+  result.isFrozen = false
   result.rootNode = newRadixNode("")
   result.middlewares = @[]
 
 proc use*(server: CompoundWebServer, middleware: Middleware) =
+  if server.isFrozen:
+    raise newException(ValueError, "Cannot add middleware after server has started (thread-safety protection).")
   server.middlewares.add(middleware)
 
 # 🌳 Radix Tree Insert: O(K) Complexity where K = URL Segment Count
 proc addRoute*(server: CompoundWebServer, meth: string, pattern: string, handler: RequestHandler) =
+  if server.isFrozen:
+    raise newException(ValueError, "Cannot add route after server has started (thread-safety protection).")
+
   let upperMeth = meth.toUpperAscii()
   let segments = pattern.strip(chars = {'/'}).split('/')
   var current = server.rootNode
@@ -190,7 +197,6 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
       if pass:
         await handler(ctx)
       else:
-        # 🔑 FIX 3: Proper 401/403 Middleware Rejection Status Code
         let authErrHeaders = newHttpHeaders([("Content-Type", "application/json")])
         await req.respond(Http401, "{\"error\": \"401 Unauthorized\", \"message\": \"Middleware access denied\"}", authErrHeaders)
     else:
@@ -200,35 +206,49 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
     let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
     await req.respond(Http500, "{\"error\": \"500 Internal Server Error\", \"message\": \"" & e.msg & "\"}", errHeaders)
 
-# 🚀 Multi-Core Multi-Threaded Cluster Engine (SO_REUSEPORT)
+# 🚀 OS-Specific Multi-Threading Worker Thread (POSIX SO_REUSEPORT vs Windows Fallback)
 proc startWorkerThread(args: tuple[server: CompoundWebServer, workerId: int]) {.thread, gcsafe.} =
   let server = args.server
-  let workerId = args.workerId
-  let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
+  
+  when defined(windows):
+    # Windows fallback: SO_REUSEPORT not supported natively on Windows Sockets
+    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = false)
+  else:
+    # Linux / macOS: Full SO_REUSEPORT native OS load balancing
+    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
   
   proc cb(req: Request) {.async, gcsafe.} =
     await server.handleRequest(req)
 
   waitFor httpSer.serve(Port(server.port), cb)
 
-# 🚀 Server Startup (Single or Multi-Threaded Worker Pool)
+# 🚀 Server Startup (Thread-Freeze Guard & Cross-Platform Dispatch)
 proc start*(server: CompoundWebServer, multiThreaded: bool = true, numWorkers: int = 0) =
+  server.isFrozen = true # Freeze route mutations for ORC thread safety
   let startTime = cpuTime()
   let availableCores = countProcessors()
   let workersCount = if numWorkers > 0: numWorkers else: availableCores
   let elapsedMs = (cpuTime() - startTime) * 1000.0
 
-  echo "🚀 [compound-web v2.1] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
-  echo "💻 [compound-web v2.1] Multi-Core SO_REUSEPORT Cluster Active: " & $workersCount & " worker threads (CPUs: " & $availableCores & ")"
-  echo "📡 [compound-web v2.1] Multi-threaded Listening on http://localhost:" & $server.port
-
-  if multiThreaded and workersCount > 1:
-    var threads = newSeq[Thread[tuple[server: CompoundWebServer, workerId: int]]](workersCount)
-    for i in 0 ..< workersCount:
-      createThread(threads[i], startWorkerThread, (server, i + 1))
-    joinThreads(threads)
-  else:
-    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
+  echo "🚀 [compound-web v2.2] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
+  
+  when defined(windows):
+    echo "🪟 [compound-web v2.2] Windows OS Detected: Single-listener event loop fallback active (SO_REUSEPORT disabled for Windows compatibility)."
+    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = false)
     proc cb(req: Request) {.async, gcsafe.} =
       await server.handleRequest(req)
     waitFor httpSer.serve(Port(server.port), cb)
+  else:
+    echo "🐧 [compound-web v2.2] POSIX OS (Linux/macOS) Detected: SO_REUSEPORT Cluster Active with " & $workersCount & " worker threads (CPUs: " & $availableCores & ")"
+    echo "📡 [compound-web v2.2] Multi-threaded Listening on http://localhost:" & $server.port
+
+    if multiThreaded and workersCount > 1:
+      var threads = newSeq[Thread[tuple[server: CompoundWebServer, workerId: int]]](workersCount)
+      for i in 0 ..< workersCount:
+        createThread(threads[i], startWorkerThread, (server, i + 1))
+      joinThreads(threads)
+    else:
+      let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
+      proc cb(req: Request) {.async, gcsafe.} =
+        await server.handleRequest(req)
+      waitFor httpSer.serve(Port(server.port), cb)
