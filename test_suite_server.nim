@@ -55,5 +55,5 @@ app.addRoute("GET", "/benchmark", proc(ctx: Context): Future[void] {.async.} =
   await ctx.sendJson("{\"status\":\"ok\"}")
 )
 
-echo "Starting Enhanced Multi-Core Compound Web Server on port 8085..."
-app.start(multiThreaded = true)
+echo "Starting Enhanced Pre-Fork Multi-Process Compound Web Server on port 8085..."
+app.start(mode = "prefork")

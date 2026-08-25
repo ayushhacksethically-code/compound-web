@@ -1,4 +1,4 @@
-import std/[asynchttpserver, asyncdispatch, tables, strutils, uri, json, times, os, cpuinfo]
+import std/[asynchttpserver, asyncdispatch, tables, strutils, uri, json, times, os, osproc, cpuinfo]
 
 type
   RequestParams* = Table[string, string]
@@ -22,7 +22,7 @@ type
     port*: int
     maxBodySize*: int # Default 10MB
     enableCors*: bool
-    isFrozen*: bool # Invariant: Route table frozen after server startup for thread safety
+    isFrozen*: bool # Invariant: Route table frozen after server startup for thread/process safety
     rootNode*: RadixNode
     middlewares*: seq[Middleware]
 
@@ -45,13 +45,13 @@ proc newServer*(port: int = 8080, maxBodySize: int = 10 * 1024 * 1024, enableCor
 
 proc use*(server: CompoundWebServer, middleware: Middleware) =
   if server.isFrozen:
-    raise newException(ValueError, "Cannot add middleware after server has started (thread-safety protection).")
+    raise newException(ValueError, "Cannot add middleware after server has started.")
   server.middlewares.add(middleware)
 
 # 🌳 Radix Tree Insert: O(K) Complexity where K = URL Segment Count
 proc addRoute*(server: CompoundWebServer, meth: string, pattern: string, handler: RequestHandler) =
   if server.isFrozen:
-    raise newException(ValueError, "Cannot add route after server has started (thread-safety protection).")
+    raise newException(ValueError, "Cannot add route after server has started.")
 
   let upperMeth = meth.toUpperAscii()
   let segments = pattern.strip(chars = {'/'}).split('/')
@@ -99,13 +99,11 @@ proc matchRoute*(server: CompoundWebServer, meth: string, path: string, params: 
     if seg.len == 0: continue
     var matchedChild: RadixNode = nil
 
-    # First attempt exact segment match
     for child in current.children:
       if not child.isParam and child.segment == seg:
         matchedChild = child
         break
 
-    # If no exact match, attempt param match (:id)
     if matchedChild.isNil:
       for child in current.children:
         if child.isParam:
@@ -152,7 +150,6 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
     let meth = ($req.reqMethod).toUpperAscii()
     let path = req.url.path
 
-    # 1. Handle CORS Preflight OPTIONS
     if server.enableCors and meth == "OPTIONS":
       let corsHeaders = newHttpHeaders([
         ("Access-Control-Allow-Origin", "*"),
@@ -162,7 +159,6 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
       await req.respond(Http204, "", corsHeaders)
       return
 
-    # 2. Upfront Content-Length Header Check (Early DoS Protection)
     if req.headers.hasKey("Content-Length"):
       try:
         let contentLength = parseInt(req.headers["Content-Length"])
@@ -173,13 +169,11 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
       except ValueError:
         discard
 
-    # 3. Body Size Guard
     if req.body.len > server.maxBodySize:
       let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
       await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
       return
 
-    # 4. Radix Tree O(K) Route Dispatching
     var params = initTable[string, string]()
     var handler: RequestHandler = nil
     let found = server.matchRoute(meth, path, params, handler)
@@ -187,7 +181,6 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
     if found and not handler.isNil:
       let ctx = Context(req: req, params: params, query: getQueryMap(req.url.query))
       
-      # Execute Middlewares
       var pass = true
       for mw in server.middlewares:
         if not (await mw(ctx)):
@@ -206,49 +199,56 @@ proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
     let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
     await req.respond(Http500, "{\"error\": \"500 Internal Server Error\", \"message\": \"" & e.msg & "\"}", errHeaders)
 
-# 🚀 OS-Specific Multi-Threading Worker Thread (POSIX SO_REUSEPORT vs Windows Fallback)
-proc startWorkerThread(args: tuple[server: CompoundWebServer, workerId: int]) {.thread, gcsafe.} =
-  let server = args.server
-  
-  when defined(windows):
-    # Windows fallback: SO_REUSEPORT not supported natively on Windows Sockets
-    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = false)
-  else:
-    # Linux / macOS: Full SO_REUSEPORT native OS load balancing
-    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
-  
-  proc cb(req: Request) {.async, gcsafe.} =
-    await server.handleRequest(req)
-
-  waitFor httpSer.serve(Port(server.port), cb)
-
-# 🚀 Server Startup (Thread-Freeze Guard & Cross-Platform Dispatch)
-proc start*(server: CompoundWebServer, multiThreaded: bool = true, numWorkers: int = 0) =
-  server.isFrozen = true # Freeze route mutations for ORC thread safety
-  let startTime = cpuTime()
-  let availableCores = countProcessors()
+# 🏭 Multi-Process Architecture (Pre-Fork Worker Model like Nginx / Gunicorn)
+# Zero Shared Memory Contention, Independent OS Heaps & SO_REUSEPORT Kernel Balancing
+proc start*(server: CompoundWebServer, mode: string = "prefork", numWorkers: int = 0) =
+  server.isFrozen = true
+  let availableCores = cpuinfo.countProcessors()
   let workersCount = if numWorkers > 0: numWorkers else: availableCores
-  let elapsedMs = (cpuTime() - startTime) * 1000.0
+  let params = commandLineParams()
 
-  echo "🚀 [compound-web v2.2] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
-  
-  when defined(windows):
-    echo "🪟 [compound-web v2.2] Windows OS Detected: Single-listener event loop fallback active (SO_REUSEPORT disabled for Windows compatibility)."
-    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = false)
-    proc cb(req: Request) {.async, gcsafe.} =
-      await server.handleRequest(req)
-    waitFor httpSer.serve(Port(server.port), cb)
-  else:
-    echo "🐧 [compound-web v2.2] POSIX OS (Linux/macOS) Detected: SO_REUSEPORT Cluster Active with " & $workersCount & " worker threads (CPUs: " & $availableCores & ")"
-    echo "📡 [compound-web v2.2] Multi-threaded Listening on http://localhost:" & $server.port
+  # Check if running as a spawned worker process
+  var isWorker = false
+  var workerId = 0
+  for p in params:
+    if p.startsWith("--worker-id="):
+      isWorker = true
+      workerId = parseInt(p.split('=')[1])
+      break
 
-    if multiThreaded and workersCount > 1:
-      var threads = newSeq[Thread[tuple[server: CompoundWebServer, workerId: int]]](workersCount)
-      for i in 0 ..< workersCount:
-        createThread(threads[i], startWorkerThread, (server, i + 1))
-      joinThreads(threads)
+  if isWorker:
+    # -------------------------------------------------------------
+    # WORKER PROCESS LOOP: Completely Isolated Memory & Event Loop
+    # -------------------------------------------------------------
+    when defined(windows):
+      let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = false)
     else:
       let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
-      proc cb(req: Request) {.async, gcsafe.} =
-        await server.handleRequest(req)
-      waitFor httpSer.serve(Port(server.port), cb)
+
+    proc cb(req: Request) {.async, gcsafe.} =
+      await server.handleRequest(req)
+
+    waitFor httpSer.serve(Port(server.port), cb)
+
+  else:
+    # -------------------------------------------------------------
+    # MASTER PROCESS (Orchestrator & Pre-Fork Process Manager)
+    # -------------------------------------------------------------
+    let exePath = getAppFilename()
+    echo "👑 [compound-web v3.0] Pre-Fork Master Process PID: " & $getCurrentProcessId()
+    echo "⚡ [compound-web v3.0] Spawning " & $workersCount & " Independent Worker Processes (SO_REUSEPORT)"
+    echo "📡 [compound-web v3.0] Cluster listening on http://localhost:" & $server.port
+
+    var workerProcs: seq[Process] = @[]
+    for i in 1 .. workersCount:
+      let p = startProcess(exePath, args = ["--worker-id=" & $i], options = {poParentStreams})
+      workerProcs.add(p)
+      echo "  • Spawned Worker #" & $i & " (PID: " & $p.processID & ")"
+
+    # Master Monitor Loop
+    while true:
+      sleep(1000)
+      for i in 0 ..< workerProcs.len:
+        if not workerProcs[i].running:
+          echo "⚠️ Worker PID " & $workerProcs[i].processID & " exited. Respawning Worker #" & $(i + 1) & "..."
+          workerProcs[i] = startProcess(exePath, args = ["--worker-id=" & $(i + 1)], options = {poParentStreams})
