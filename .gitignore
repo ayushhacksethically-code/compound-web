@@ -1,0 +1,17 @@
+# Exclude compiled binaries
+/test_suite_server
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+
+# Firebase & Deployment configs
+.firebase/
+.firebaserc
+firebase.json
+
+# Test logs & temporary python caches
+__pycache__/
+*.log
+.DS_Store
