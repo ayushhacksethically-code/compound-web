@@ -140,71 +140,95 @@ proc sendJson*(ctx: Context, jsonString: string, status: HttpCode = Http200) {.a
 proc getBody*(ctx: Context): string =
   return ctx.req.body
 
-# 🚀 Server Startup with CPU Core Detection
-proc start*(server: CompoundWebServer) =
-  let startTime = cpuTime()
-  let numCores = countProcessors()
-  let httpSer = newAsyncHttpServer()
-  let elapsedMs = (cpuTime() - startTime) * 1000.0
+proc handleRequest*(server: CompoundWebServer, req: Request) {.async, gcsafe.} =
+  try:
+    let meth = ($req.reqMethod).toUpperAscii()
+    let path = req.url.path
 
-  echo "🚀 [compound-web v2] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
-  echo "💻 [compound-web v2] Detected CPU Cores: " & $numCores
-  echo "📡 [compound-web v2] Listening on http://localhost:" & $server.port
+    # 1. Handle CORS Preflight OPTIONS
+    if server.enableCors and meth == "OPTIONS":
+      let corsHeaders = newHttpHeaders([
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
+        ("Access-Control-Allow-Headers", "Content-Type, Authorization")
+      ])
+      await req.respond(Http204, "", corsHeaders)
+      return
 
-  proc cb(req: Request) {.async, gcsafe.} =
-    try:
-      let meth = ($req.reqMethod).toUpperAscii()
-      let path = req.url.path
+    # 2. Upfront Content-Length Header Check (Early DoS Protection)
+    if req.headers.hasKey("Content-Length"):
+      try:
+        let contentLength = parseInt(req.headers["Content-Length"])
+        if contentLength > server.maxBodySize:
+          let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
+          await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
+          return
+      except ValueError:
+        discard
 
-      # 1. Handle CORS Preflight OPTIONS
-      if server.enableCors and meth == "OPTIONS":
-        let corsHeaders = newHttpHeaders([
-          ("Access-Control-Allow-Origin", "*"),
-          ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
-          ("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        ])
-        await req.respond(Http204, "", corsHeaders)
-        return
-
-      # 2. Upfront Content-Length Header Check (Early DoS Protection)
-      if req.headers.hasKey("Content-Length"):
-        try:
-          let contentLength = parseInt(req.headers["Content-Length"])
-          if contentLength > server.maxBodySize:
-            let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
-            await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
-            return
-        except ValueError:
-          discard
-
-      # 3. Body Size Guard
-      if req.body.len > server.maxBodySize:
-        let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
-        await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
-        return
-
-      # 4. Radix Tree O(K) Route Dispatching
-      var params = initTable[string, string]()
-      var handler: RequestHandler = nil
-      let found = server.matchRoute(meth, path, params, handler)
-
-      if found and not handler.isNil:
-        let ctx = Context(req: req, params: params, query: getQueryMap(req.url.query))
-        
-        # Execute Middlewares
-        var pass = true
-        for mw in server.middlewares:
-          if not (await mw(ctx)):
-            pass = false
-            break
-        
-        if pass:
-          await handler(ctx)
-      else:
-        let notFoundHeaders = newHttpHeaders([("Content-Type", "application/json")])
-        await req.respond(Http404, "{\"error\": \"404 Not Found\", \"path\": \"" & path & "\"}", notFoundHeaders)
-    except Exception as e:
+    # 3. Body Size Guard
+    if req.body.len > server.maxBodySize:
       let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
-      await req.respond(Http500, "{\"error\": \"500 Internal Server Error\", \"message\": \"" & e.msg & "\"}", errHeaders)
+      await req.respond(Http413, "{\"error\": \"413 Payload Too Large\", \"limit_bytes\": " & $server.maxBodySize & "}", errHeaders)
+      return
+
+    # 4. Radix Tree O(K) Route Dispatching
+    var params = initTable[string, string]()
+    var handler: RequestHandler = nil
+    let found = server.matchRoute(meth, path, params, handler)
+
+    if found and not handler.isNil:
+      let ctx = Context(req: req, params: params, query: getQueryMap(req.url.query))
+      
+      # Execute Middlewares
+      var pass = true
+      for mw in server.middlewares:
+        if not (await mw(ctx)):
+          pass = false
+          break
+      
+      if pass:
+        await handler(ctx)
+      else:
+        # 🔑 FIX 3: Proper 401/403 Middleware Rejection Status Code
+        let authErrHeaders = newHttpHeaders([("Content-Type", "application/json")])
+        await req.respond(Http401, "{\"error\": \"401 Unauthorized\", \"message\": \"Middleware access denied\"}", authErrHeaders)
+    else:
+      let notFoundHeaders = newHttpHeaders([("Content-Type", "application/json")])
+      await req.respond(Http404, "{\"error\": \"404 Not Found\", \"path\": \"" & path & "\"}", notFoundHeaders)
+  except Exception as e:
+    let errHeaders = newHttpHeaders([("Content-Type", "application/json")])
+    await req.respond(Http500, "{\"error\": \"500 Internal Server Error\", \"message\": \"" & e.msg & "\"}", errHeaders)
+
+# 🚀 Multi-Core Multi-Threaded Cluster Engine (SO_REUSEPORT)
+proc startWorkerThread(args: tuple[server: CompoundWebServer, workerId: int]) {.thread, gcsafe.} =
+  let server = args.server
+  let workerId = args.workerId
+  let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
+  
+  proc cb(req: Request) {.async, gcsafe.} =
+    await server.handleRequest(req)
 
   waitFor httpSer.serve(Port(server.port), cb)
+
+# 🚀 Server Startup (Single or Multi-Threaded Worker Pool)
+proc start*(server: CompoundWebServer, multiThreaded: bool = true, numWorkers: int = 0) =
+  let startTime = cpuTime()
+  let availableCores = countProcessors()
+  let workersCount = if numWorkers > 0: numWorkers else: availableCores
+  let elapsedMs = (cpuTime() - startTime) * 1000.0
+
+  echo "🚀 [compound-web v2.1] Radix-Tree Engine initialized in " & $elapsedMs.formatFloat(ffDecimal, 3) & " ms"
+  echo "💻 [compound-web v2.1] Multi-Core SO_REUSEPORT Cluster Active: " & $workersCount & " worker threads (CPUs: " & $availableCores & ")"
+  echo "📡 [compound-web v2.1] Multi-threaded Listening on http://localhost:" & $server.port
+
+  if multiThreaded and workersCount > 1:
+    var threads = newSeq[Thread[tuple[server: CompoundWebServer, workerId: int]]](workersCount)
+    for i in 0 ..< workersCount:
+      createThread(threads[i], startWorkerThread, (server, i + 1))
+    joinThreads(threads)
+  else:
+    let httpSer = newAsyncHttpServer(reuseAddr = true, reusePort = true)
+    proc cb(req: Request) {.async, gcsafe.} =
+      await server.handleRequest(req)
+    waitFor httpSer.serve(Port(server.port), cb)

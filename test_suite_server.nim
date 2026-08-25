@@ -1,6 +1,5 @@
 import web, std/[asynchttpserver, asyncdispatch, json, times, tables, strutils]
 
-# Max body limit set to 1MB (1,048,576 bytes) for OOM testing
 let app = newServer(port = 8085, maxBodySize = 1 * 1024 * 1024, enableCors = true)
 let serverStartTime = cpuTime()
 
@@ -29,6 +28,20 @@ app.addRoute("POST", "/api/echo", proc(ctx: Context): Future[void] {.async.} =
     await ctx.sendJson($ %*{"error": "500 Internal Error", "details": e.msg}, Http500)
 )
 
+# Test Middleware Rejection (401 Unauthorized)
+app.addRoute("GET", "/admin/dashboard", proc(ctx: Context): Future[void] {.async.} =
+  await ctx.sendJson("{\"secret\": \"admin_data\"}")
+)
+
+# Protect /admin routes with authentication middleware
+app.use(proc(ctx: Context): Future[bool] {.async.} =
+  if ctx.req.url.path.startsWith("/admin"):
+    let authHeader = ctx.req.headers.getOrDefault("Authorization")
+    if authHeader != "Bearer secret_token":
+      return false # Reject access -> 401 Unauthorized
+  return true
+)
+
 # Test 2 Edge Case: Unicode & URL Params
 app.addRoute("GET", "/users/:id", proc(ctx: Context): Future[void] {.async.} =
   let userId = ctx.params.getOrDefault("id", "0")
@@ -37,18 +50,10 @@ app.addRoute("GET", "/users/:id", proc(ctx: Context): Future[void] {.async.} =
   await ctx.sendJson($responseJson)
 )
 
-# Test 5: File Upload / Multipart Form Handling
-app.addRoute("POST", "/upload", proc(ctx: Context): Future[void] {.async.} =
-  let bodyStr = ctx.getBody()
-  let size = bodyStr.len
-  let res = %*{"received_bytes": size, "status": "uploaded_successfully"}
-  await ctx.sendJson($res)
-)
-
 # Test 3: High Throughput Benchmark Endpoint
 app.addRoute("GET", "/benchmark", proc(ctx: Context): Future[void] {.async.} =
   await ctx.sendJson("{\"status\":\"ok\"}")
 )
 
-echo "Starting Enhanced Compound Web Server on port 8085..."
-app.start()
+echo "Starting Enhanced Multi-Core Compound Web Server on port 8085..."
+app.start(multiThreaded = true)
