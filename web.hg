@@ -1,0 +1,21 @@
+# 🌐 compound-web (Hinglish Dialect Interface)
+
+# Server object and helper methods in Hinglish
+rakho server_port = 8080
+
+kaam server_banao(p) toh
+    server_port = p
+    dikhao "🌐 Web server port par ready hai:", p
+khatam
+
+kaam route_suno(path, handler) toh
+    dikhao "📍 Registered Route:", path
+khatam
+
+kaam jawab_bhejo(msg) toh
+    wapas "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + msg
+khatam
+
+kaam server_chalao() toh
+    dikhao "🚀 Server running at http://localhost:" + $server_port
+khatam

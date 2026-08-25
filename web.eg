@@ -1,0 +1,21 @@
+# 🌐 compound-web (English Dialect Interface)
+
+# Server object and helper methods in English
+keep server_port = 8080
+
+task create_server(p) do
+    server_port = p
+    show "🌐 Web server ready on port:", p
+done
+
+task listen_route(path, handler) do
+    show "📍 Registered Route:", path
+done
+
+task send_response(msg) do
+    return "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + msg
+done
+
+task start_server() do
+    show "🚀 Server running at http://localhost:" + $server_port
+done

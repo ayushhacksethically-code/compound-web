@@ -1,0 +1,7 @@
+[project]
+name = "compound-web"
+version = "1.0.0"
+dialect = "hinglish"
+description = "Lightweight micro web server & REST API framework for Compound language"
+
+[dependencies]
